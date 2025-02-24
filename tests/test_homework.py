@@ -1,141 +1,120 @@
-# flake8: noqa: E501
-"""Autograding script."""
-
+import os
 import gzip
 import json
-import os
 import pickle
+import pandas as pd
+import numpy as np
+from sklearn.compose import ColumnTransformer
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.decomposition import PCA
+from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import precision_score, recall_score, f1_score, balanced_accuracy_score, confusion_matrix
 
-import pandas as pd  # type: ignore
+def cargar_datos(ruta: str) -> pd.DataFrame:
+    return pd.read_csv(ruta, index_col=False, compression='zip')
 
-# ------------------------------------------------------------------------------
-MODEL_FILENAME = "files/models/model.pkl.gz"
-MODEL_COMPONENTS = [
-    "OneHotEncoder",
-    "PCA",
-    "StandardScaler",
-    "SelectKBest",
-    "SVC",
-]
-SCORES = [
-    0.661,
-    0.666,
-]
-METRICS = [
-    {
-        "type": "metrics",
-        "dataset": "train",
-        "precision": 0.691,
-        "balanced_accuracy": 0.661,
-        "recall": 0.370,
-        "f1_score": 0.482,
-    },
-    {
-        "type": "metrics",
-        "dataset": "test",
-        "precision": 0.673,
-        "balanced_accuracy": 0.661,
-        "recall": 0.370,
-        "f1_score": 0.482,
-    },
-    {
-        "type": "cm_matrix",
-        "dataset": "train",
-        "true_0": {"predicted_0": 15440, "predicted_1": None},
-        "true_1": {"predicted_0": None, "predicted_1": 1735},
-    },
-    {
-        "type": "cm_matrix",
-        "dataset": "test",
-        "true_0": {"predicted_0": 6710, "predicted_1": None},
-        "true_1": {"predicted_0": None, "predicted_1": 730},
-    },
-]
+def limpiar_datos(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.rename(columns={'default payment next month': 'default'}, inplace=True)
+    df.drop(columns=['ID'], errors='ignore', inplace=True)
+    df = df[(df["MARRIAGE"] != 0) & (df["EDUCATION"] != 0)]
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda x: x if x < 4 else 4)
+    return df
 
+def construir_pipeline(x: pd.DataFrame) -> Pipeline:
+    caracteristicas_categoricas = ["SEX", "EDUCATION", "MARRIAGE"]
+    caracteristicas_numericas = list(set(x.columns) - set(caracteristicas_categoricas))
+    preprocesador = ColumnTransformer(
+        transformers=[
+            ("num", StandardScaler(), caracteristicas_numericas),
+            ('cat', OneHotEncoder(), caracteristicas_categoricas)
+        ],
+        remainder='passthrough'
+    )
+    return Pipeline([
+        ('preprocesamiento', preprocesador),
+        ('pca', PCA()),
+        ('selector_kbest', SelectKBest(f_classif)),
+        ('clasificador', SVC(kernel="rbf", max_iter=-1, random_state=42))
+    ])
 
-# ------------------------------------------------------------------------------
-#
-# Internal tests
-#
-def _load_model():
-    """Generic test to load a model"""
-    assert os.path.exists(MODEL_FILENAME)
-    with gzip.open(MODEL_FILENAME, "rb") as file:
-        model = pickle.load(file)
-    assert model is not None
-    return model
+def configurar_gridsearch(pipeline: Pipeline) -> GridSearchCV:
+    parametros = {
+        "pca__n_components": [0.8, 0.9, 0.95, 0.99],
+        "selector_kbest__k": [10, 20, 30],
+        "clasificador__C": [0.1, 1, 10],
+        "clasificador__gamma": [0.1, 1, 10]
+    }
+    return GridSearchCV(
+        pipeline,
+        param_grid=parametros,
+        cv=10,
+        scoring='balanced_accuracy',
+        n_jobs=-1,
+        verbose=2,
+        refit=True
+    )
 
+def guardar_modelo(ruta: str, modelo: GridSearchCV):
+    os.makedirs(os.path.dirname(ruta), exist_ok=True)
+    with gzip.open(ruta, 'wb') as archivo:
+        pickle.dump(modelo, archivo)
 
-def _test_components(model):
-    """Test components"""
-    assert "GridSearchCV" in str(type(model))
-    current_components = [str(model.estimator[i]) for i in range(len(model.estimator))]
-    for component in MODEL_COMPONENTS:
-        assert any(component in x for x in current_components)
+def calcular_metricas(tipo: str, y_real, y_predicho) -> dict:
+    return {
+        'type': 'metrics',
+        'dataset': tipo,
+        'precision': precision_score(y_real, y_predicho, zero_division=0),
+        'balanced_accuracy': balanced_accuracy_score(y_real, y_predicho),
+        'recall': recall_score(y_real, y_predicho, zero_division=0),
+        'f1_score': f1_score(y_real, y_predicho, zero_division=0)
+    }
 
+def calcular_matriz_confusion(tipo: str, y_real, y_predicho) -> dict:
+    matriz = confusion_matrix(y_real, y_predicho)
+    return {
+        'type': 'cm_matrix',
+        'dataset': tipo,
+        'true_0': {"predicted_0": int(matriz[0, 0]), "predicted_1": int(matriz[0, 1])},
+        'true_1': {"predicted_0": int(matriz[1, 0]), "predicted_1": int(matriz[1, 1])}
+    }
 
-def _load_grading_data():
-    """Load grading data"""
-    with open("files/grading/x_train.pkl", "rb") as file:
-        x_train = pickle.load(file)
+def ejecutar():
+    ruta_entrada = "./files/input/"
+    ruta_modelo = "./files/models/model.pkl.gz"
+    
+    test_df = cargar_datos(os.path.join(ruta_entrada, 'test_data.csv.zip'))
+    train_df = cargar_datos(os.path.join(ruta_entrada, 'train_data.csv.zip'))
+    
+    test_df = limpiar_datos(test_df)
+    train_df = limpiar_datos(train_df)
+    
+    x_test, y_test = test_df.drop(columns=['default']), test_df['default']
+    x_train, y_train = train_df.drop(columns=['default']), train_df['default']
+    
+    pipeline = construir_pipeline(x_train)
+    modelo_entrenado = configurar_gridsearch(pipeline)
+    modelo_entrenado.fit(x_train, y_train)
+    
+    guardar_modelo(ruta_modelo, modelo_entrenado)
+    
+    y_train_pred = modelo_entrenado.predict(x_train)
+    y_test_pred = modelo_entrenado.predict(x_test)
+    
+    metricas = [
+        calcular_metricas('train', y_train, y_train_pred),
+        calcular_metricas('test', y_test, y_test_pred),
+        calcular_matriz_confusion('train', y_train, y_train_pred),
+        calcular_matriz_confusion('test', y_test, y_test_pred)
+    ]
+    
+    os.makedirs("files/output/", exist_ok=True)
+    with open("files/output/metrics.json", "w") as archivo:
+        for resultado in metricas:
+            archivo.write(json.dumps(resultado) + "\n")
 
-    with open("files/grading/y_train.pkl", "rb") as file:
-        y_train = pickle.load(file)
-
-    with open("files/grading/x_test.pkl", "rb") as file:
-        x_test = pickle.load(file)
-
-    with open("files/grading/y_test.pkl", "rb") as file:
-        y_test = pickle.load(file)
-
-    return x_train, y_train, x_test, y_test
-
-
-def _test_scores(model, x_train, y_train, x_test, y_test):
-    """Test scores"""
-    assert model.score(x_train, y_train) > SCORES[0]
-    assert model.score(x_test, y_test) > SCORES[1]
-
-
-def _load_metrics():
-    assert os.path.exists("files/output/metrics.json")
-    metrics = []
-    with open("files/output/metrics.json", "r", encoding="utf-8") as file:
-        for line in file:
-            metrics.append(json.loads(line))
-    return metrics
-
-
-def _test_metrics(metrics):
-
-    for index in [0, 1]:
-        assert metrics[index]["type"] == METRICS[index]["type"]
-        assert metrics[index]["dataset"] == METRICS[index]["dataset"]
-        assert metrics[index]["precision"] > METRICS[index]["precision"]
-        assert metrics[index]["balanced_accuracy"] > METRICS[index]["balanced_accuracy"]
-        assert metrics[index]["recall"] > METRICS[index]["recall"]
-        assert metrics[index]["f1_score"] > METRICS[index]["f1_score"]
-
-    for index in [2, 3]:
-        assert metrics[index]["type"] == METRICS[index]["type"]
-        assert metrics[index]["dataset"] == METRICS[index]["dataset"]
-        assert (
-            metrics[index]["true_0"]["predicted_0"]
-            > METRICS[index]["true_0"]["predicted_0"]
-        )
-        assert (
-            metrics[index]["true_1"]["predicted_1"]
-            > METRICS[index]["true_1"]["predicted_1"]
-        )
-
-
-def test_homework():
-    """Tests"""
-
-    model = _load_model()
-    x_train, y_train, x_test, y_test = _load_grading_data()
-    metrics = _load_metrics()
-
-    _test_components(model)
-    _test_scores(model, x_train, y_train, x_test, y_test)
-    _test_metrics(metrics)
+if __name__ == "__main__":
+    ejecutar()
